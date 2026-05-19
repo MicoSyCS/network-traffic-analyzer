@@ -49,7 +49,7 @@ def main():
         )
     except PermissionError:
         print("[!] Permission denied. Try running with sudo / as Administrator.")
-        sys.exit(1)~
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\n[+] Capture stopped by user.")
         sys.exit(0)
