@@ -125,9 +125,11 @@ class AlertLogger:
 
     def __init__(self,
                  db_path: Path | str | None = None,
-                 txt_path: Path | str | None = None):
+                 txt_path: Path | str | None = None,
+                 print_alerts: bool = True):
         self.db_path = Path(db_path) if db_path else _DEFAULT_DB_PATH
         self.txt_path = Path(txt_path) if txt_path else _DEFAULT_TXT_PATH
+        self.print_alerts = print_alerts
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.txt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,7 +209,7 @@ class AlertLogger:
         # Red console output for high/critical, AFTER persistence.
         # Done outside the lock — print is fine without it, and we don't
         # want any I/O blocking the next alert's DB write.
-        if severity in ("high", "critical"):
+        if self.print_alerts and severity in ("high", "critical"):
             print_high_severity(
                 timestamp, alert_type, source_ip, dest_ip,
                 severity, description,

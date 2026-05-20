@@ -75,15 +75,18 @@ class _BaseDetector:
     """Shared logger + console-emit behaviour for all detectors."""
 
     def __init__(self, log_file: Path | str | None = None,
-                 log_to_file: bool = True):
+                 log_to_file: bool = True,
+                 print_alerts: bool = True):
         # log_to_file=False lets a central AlertLogger own the file/DB output
         # while detectors still print to stdout for immediate feedback.
+        # print_alerts=False additionally silences stdout (used by the TUI).
         self.log_to_file = log_to_file
+        self.print_alerts = print_alerts
         self.log_file = Path(log_file) if log_file else _DEFAULT_LOG_FILE
         self._logger = _build_logger(self.log_file) if log_to_file else None
 
     def _emit_alert(self, alert: dict, detail: str = "") -> dict:
-        """Write alert to log file (if enabled) and surface it on stdout."""
+        """Write alert to log file (if enabled) and surface it on stdout (if enabled)."""
         header = f"[{alert['type'].upper()}/{alert['severity'].upper()}] {alert['message']}"
         if self._logger is not None:
             log_line = f"{header} — source={alert['source']}"
@@ -91,11 +94,12 @@ class _BaseDetector:
                 log_line = f"{log_line} — {detail}"
             self._logger.warning(log_line)
 
-        print(f"\n[!! ALERT {alert['timestamp']}] {header}")
-        print(f"    source={alert['source']}")
-        if detail:
-            print(f"    {detail}")
-        print()
+        if self.print_alerts:
+            print(f"\n[!! ALERT {alert['timestamp']}] {header}")
+            print(f"    source={alert['source']}")
+            if detail:
+                print(f"    {detail}")
+            print()
         return alert
 
 
@@ -120,8 +124,10 @@ class PortScanDetector(_BaseDetector):
         window_seconds: int = 60,
         log_file: Path | str | None = None,
         log_to_file: bool = True,
+        print_alerts: bool = True,
     ):
-        super().__init__(log_file, log_to_file=log_to_file)
+        super().__init__(log_file, log_to_file=log_to_file,
+                         print_alerts=print_alerts)
         self.threshold = threshold
         self.window_seconds = window_seconds
 
@@ -210,8 +216,10 @@ class DNSAnomalyDetector(_BaseDetector):
 
     def __init__(self, max_length: int = 50,
                  log_file: Path | str | None = None,
-                 log_to_file: bool = True):
-        super().__init__(log_file, log_to_file=log_to_file)
+                 log_to_file: bool = True,
+                 print_alerts: bool = True):
+        super().__init__(log_file, log_to_file=log_to_file,
+                         print_alerts=print_alerts)
         self.max_length = max_length
         self._seen: set[tuple[str, str]] = set()  # (src, domain) dedup
 
@@ -290,8 +298,10 @@ class LargeTransferDetector(_BaseDetector):
         threshold_bytes: int = 10 * 1024 * 1024,  # 10 MB
         log_file: Path | str | None = None,
         log_to_file: bool = True,
+        print_alerts: bool = True,
     ):
-        super().__init__(log_file, log_to_file=log_to_file)
+        super().__init__(log_file, log_to_file=log_to_file,
+                         print_alerts=print_alerts)
         self.threshold_bytes = threshold_bytes
         # connection_key -> {"bytes": int, "source": "ip:port",
         #                    "destination": "ip:port", "alerted": bool}

@@ -12,6 +12,10 @@ Modes:
     Pcap replay:
         python main.py --pcap path/to/capture.pcap
 
+    TUI dashboard (live or pcap):
+        sudo python main.py --tui
+        python main.py --pcap path/to/capture.pcap --tui
+
 Wiring:
     sniff() / pcap replay
         └─→ capture.parse_packet → info dict
@@ -22,10 +26,12 @@ Wiring:
 
 import argparse
 import sys
+import threading
 
 from capture import start_capture
 from detector import PortScanDetector, DNSAnomalyDetector, LargeTransferDetector
 from logger import AlertLogger
+from tui import TUIState, run_tui
 
 
 def parse_args():
@@ -73,19 +79,27 @@ def parse_args():
     parser.add_argument("--no-detect", action="store_true",
         help="Disable all detectors (just print packets).")
 
+    parser.add_argument("--tui", action="store_true",
+        help="Run inside a live terminal dashboard (rich-based). Sniffer "
+             "moves to a background thread; stdout output is suppressed.")
+
     return parser.parse_args()
 
 
 def build_pipeline(args):
     """
-    Construct the (detectors, alert_logger, on_packet) tuple.
+    Construct (detectors, alert_logger, on_packet).
 
-    on_packet is the per-packet callback that fans out to all detectors
-    and forwards any returned alerts to the AlertLogger. Returns None
-    for on_packet if detection is disabled.
+    on_packet fans out to all detectors and forwards any returned alert
+    to the AlertLogger. Returns ([], None, None) if detection is disabled.
+
+    When `args.tui` is set, detectors and logger are configured to not
+    print to stdout (the TUI renders everything itself).
     """
     if args.no_detect:
         return [], None, None
+
+    quiet = args.tui  # TUI mode silences all stdout from the alert path
 
     # log_to_file=False so detectors only print to stdout; the AlertLogger
     # is the sole owner of file/DB output.
@@ -94,23 +108,27 @@ def build_pipeline(args):
             threshold=args.scan_threshold,
             window_seconds=args.scan_window,
             log_to_file=False,
+            print_alerts=not quiet,
         ),
         DNSAnomalyDetector(
             max_length=args.dns_max_length,
             log_to_file=False,
+            print_alerts=not quiet,
         ),
         LargeTransferDetector(
             threshold_bytes=int(args.transfer_threshold_mb * 1024 * 1024),
             log_to_file=False,
+            print_alerts=not quiet,
         ),
     ]
-    alert_logger = AlertLogger()
+    alert_logger = AlertLogger(print_alerts=not quiet)
 
-    print(f"[+] Detectors enabled:")
-    print(f"      port_scan       >{args.scan_threshold} ports / {args.scan_window}s")
-    print(f"      dns_anomaly     domain length > {args.dns_max_length}")
-    print(f"      large_transfer  TCP flow > {args.transfer_threshold_mb} MB")
-    print(f"[+] Alerts → {alert_logger.db_path}  &  {alert_logger.txt_path}")
+    if not quiet:
+        print(f"[+] Detectors enabled:")
+        print(f"      port_scan       >{args.scan_threshold} ports / {args.scan_window}s")
+        print(f"      dns_anomaly     domain length > {args.dns_max_length}")
+        print(f"      large_transfer  TCP flow > {args.transfer_threshold_mb} MB")
+        print(f"[+] Alerts → {alert_logger.db_path}  &  {alert_logger.txt_path}")
 
     def on_packet(info, pkt):
         for d in detectors:
@@ -143,13 +161,52 @@ def run_pcap(args, on_packet):
     print("[+] Pcap replay complete.")
 
 
+def run_tui_mode(args, detectors, alert_logger):
+    """
+    Run live or pcap mode inside the TUI.
+
+    The sniffer goes to a daemon thread and writes packets/alerts into a
+    shared TUIState. The TUI runs on the main thread reading that state.
+    """
+    state = TUIState()
+
+    def tui_on_packet(info, pkt):
+        state.record_packet(info)
+        for d in detectors:
+            alert = d.observe(info, pkt)
+            if alert is not None:
+                if alert_logger is not None:
+                    alert_logger.log_alert(alert)
+                state.record_alert(alert)
+
+    def sniffer_target():
+        try:
+            start_capture(
+                interface=None if args.pcap else args.iface,
+                offline=args.pcap,
+                count=args.count,
+                bpf_filter=args.bpf_filter,
+                on_packet=tui_on_packet,
+                print_packets=False,
+            )
+            state.mark_sniffer_stopped()
+        except Exception as exc:
+            state.mark_sniffer_stopped(error=f"{type(exc).__name__}: {exc}")
+
+    sniffer = threading.Thread(target=sniffer_target, daemon=True)
+    sniffer.start()
+    run_tui(state)
+
+
 def main():
     args = parse_args()
 
-    _, alert_logger, on_packet = build_pipeline(args)
+    detectors, alert_logger, on_packet = build_pipeline(args)
 
     try:
-        if args.pcap:
+        if args.tui:
+            run_tui_mode(args, detectors, alert_logger)
+        elif args.pcap:
             run_pcap(args, on_packet)
         else:
             run_live(args, on_packet)

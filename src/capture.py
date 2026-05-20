@@ -144,7 +144,7 @@ def _print_packet(info: dict) -> None:
     )
 
 
-def _make_handler(on_packet=None):
+def _make_handler(on_packet=None, print_packets=True):
     """Build the per-packet callback used by Scapy's sniff()."""
 
     def handler(packet):
@@ -154,7 +154,8 @@ def _make_handler(on_packet=None):
             print(f"[!] Failed to parse packet: {exc}")
             return
 
-        _print_packet(info)
+        if print_packets:
+            _print_packet(info)
 
         if on_packet is not None:
             on_packet(info, packet)
@@ -163,39 +164,39 @@ def _make_handler(on_packet=None):
 
 
 def start_capture(interface=None, count=0, bpf_filter=None, on_packet=None,
-                  offline=None):
+                  offline=None, print_packets=True):
     """
     Start a packet capture — either live (default) or by replaying a pcap.
 
     Args:
-        interface:  Network interface to sniff on (None = Scapy default).
-                    Ignored when `offline` is set.
-        count:      Number of packets to capture (0 = unlimited).
-        bpf_filter: Optional BPF filter string, e.g. "tcp port 80".
-        on_packet:  Optional callback receiving (info_dict, raw_packet)
-                    after each packet is printed. Useful for logging
-                    or writing to /data.
-        offline:    Path to a .pcap/.pcapng file. When set, packets are
-                    read from the file instead of a live interface and
-                    sniff() returns once the file is exhausted.
+        interface:     Network interface to sniff on (None = Scapy default).
+                       Ignored when `offline` is set.
+        count:         Number of packets to capture (0 = unlimited).
+        bpf_filter:    Optional BPF filter string, e.g. "tcp port 80".
+        on_packet:     Optional callback receiving (info_dict, raw_packet).
+        offline:       Path to a .pcap/.pcapng file. When set, packets are
+                       read from the file instead of a live interface.
+        print_packets: When False, suppress the per-packet stdout print
+                       (used by the TUI which renders packets itself).
 
     Note: live sniffing usually requires root/admin privileges.
     """
-    print("─" * 88)
-    if offline:
-        print(f"Replaying pcap     file={offline}  "
-              f"count={'all' if count == 0 else count}  "
-              f"filter={bpf_filter or 'none'}")
-    else:
-        print(f"Starting capture  iface={interface or 'default'}  "
-              f"count={'∞' if count == 0 else count}  "
-              f"filter={bpf_filter or 'none'}")
-    print("─" * 88)
+    if print_packets:
+        print("─" * 88)
+        if offline:
+            print(f"Replaying pcap     file={offline}  "
+                  f"count={'all' if count == 0 else count}  "
+                  f"filter={bpf_filter or 'none'}")
+        else:
+            print(f"Starting capture  iface={interface or 'default'}  "
+                  f"count={'∞' if count == 0 else count}  "
+                  f"filter={bpf_filter or 'none'}")
+        print("─" * 88)
 
     sniff(
         iface=interface if not offline else None,
         offline=offline,
-        prn=_make_handler(on_packet),
+        prn=_make_handler(on_packet, print_packets=print_packets),
         count=count,
         filter=bpf_filter,
         store=False,  # don't keep packets in memory; we stream them
