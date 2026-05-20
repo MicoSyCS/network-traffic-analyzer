@@ -211,17 +211,79 @@ class DNSAnomalyDetector(_BaseDetector):
     ~50 chars is a strong tunneling signal. We dedupe per (src, domain)
     so a flood of identical queries only alerts once.
 
+    To cut down on false positives from legitimate-but-long domains (CDNs,
+    cloud services, ad/telemetry endpoints), any query whose name ends with
+    a suffix in `whitelist` is ignored. Pass extra suffixes to extend the
+    defaults, or pass an explicit set to replace them.
+
     Note: encrypted DNS (DoT/DoH/DoQ) is opaque to this detector by design.
     """
+
+    # Domains/suffixes that are legitimately long and very common. Matched
+    # by case-insensitive suffix, so "clients6.google.com" also covers
+    # "5-prod-dynamite-prod-07-us-signaler-pa.clients6.google.com".
+    DEFAULT_WHITELIST: frozenset[str] = frozenset({
+        # Google
+        "clients6.google.com",
+        "googleapis.com",
+        "googleusercontent.com",
+        "googlesyndication.com",
+        "googlevideo.com",
+        "1e100.net",
+        "gvt1.com",
+        "gvt2.com",
+        # Amazon / AWS
+        "amazonaws.com",
+        "amazon-adsystem.com",
+        "cloudfront.net",
+        "amazon.dev",
+        # Microsoft
+        "azure.com",
+        "azureedge.net",
+        "windows.net",
+        "office.com",
+        "microsoft.com",
+        # CDNs / infra
+        "akamai.net",
+        "akamaiedge.net",
+        "akamaihd.net",
+        "edgekey.net",
+        "edgesuite.net",
+        "fastly.net",
+        "cloudflare.com",
+        "cdn.cloudflare.net",
+        # Gaming / media
+        "epicgames.com",
+        "steamcontent.com",
+        "nflxso.net",
+        "nflxvideo.net",
+        "tiktokcdn.com",
+    })
 
     def __init__(self, max_length: int = 50,
                  log_file: Path | str | None = None,
                  log_to_file: bool = True,
-                 print_alerts: bool = True):
+                 print_alerts: bool = True,
+                 whitelist: set[str] | None = None,
+                 extra_whitelist: set[str] | None = None):
         super().__init__(log_file, log_to_file=log_to_file,
                          print_alerts=print_alerts)
         self.max_length = max_length
+        # whitelist replaces the defaults; extra_whitelist adds to them.
+        base = set(whitelist) if whitelist is not None else set(self.DEFAULT_WHITELIST)
+        if extra_whitelist:
+            base |= set(extra_whitelist)
+        # Normalize to lowercase, strip leading dots for consistent matching.
+        self.whitelist = {d.lower().lstrip(".") for d in base}
         self._seen: set[tuple[str, str]] = set()  # (src, domain) dedup
+
+    def _is_whitelisted(self, qname: str) -> bool:
+        """True if the query name equals or is a subdomain of a whitelist entry."""
+        low = qname.lower()
+        for suffix in self.whitelist:
+            if low == suffix or low.endswith("." + suffix):
+                return True
+        return False
 
     def observe(self, info: dict, packet=None, ts: float | None = None) -> dict | None:
         # Needs the raw packet to read the DNS layer; ignore everything else.
@@ -240,6 +302,10 @@ class DNSAnomalyDetector(_BaseDetector):
             return None  # malformed DNS, ignore
 
         if len(qname) <= self.max_length:
+            return None
+
+        # Skip known-legitimate long domains.
+        if self._is_whitelisted(qname):
             return None
 
         src = info.get("src", "?")

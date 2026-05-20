@@ -47,6 +47,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import ipnames
+
 
 # ---- color/style choices --------------------------------------------------
 SEVERITY_STYLES = {
@@ -63,11 +65,13 @@ PROTOCOL_STYLES = {
     "Other": "dim white",
 }
 
+ORG_STYLE = "dim italic"  # styling for the "(Cloudflare)" annotations
+
 # ---- how much history to retain in memory --------------------------------
-# Sized for typical 24–30 row terminals. Larger than what fits on screen so
-# a brief terminal resize doesn't lose context.
-MAX_PACKET_ROWS = 25
-MAX_ALERT_ROWS = 8
+# Keep a generous buffer so a maximized/fullscreen terminal can show many
+# rows. render_packets() trims to whatever actually fits on screen.
+MAX_PACKET_ROWS = 500
+MAX_ALERT_ROWS = 50
 
 
 class TUIState:
@@ -129,7 +133,7 @@ class TUIState:
                 "alerts":         list(self._alerts),
                 "total_packets":  self._total_packets,
                 "total_alerts":   self._total_alerts,
-                "top_talkers":    self._talkers.most_common(3),
+                "top_talkers":    self._talkers.most_common(5),
                 "protocols":      dict(self._protocols),
                 "sniffer_alive":  self._sniffer_alive,
                 "sniffer_error":  self._sniffer_error,
@@ -163,18 +167,25 @@ def render_header(snap: dict) -> Panel:
     else:
         status = "[yellow]○ Stopped[/yellow]"
 
-    text = Text.from_markup(
-        f"  {status}     "
+    left = Text.from_markup(
+        f"{status}     "
         f"Packets: [bold cyan]{snap['total_packets']:,}[/bold cyan]     "
         f"Alerts: [bold red]{snap['total_alerts']}[/bold red]     "
-        f"Uptime: [bold]{_format_uptime(snap['uptime'])}[/bold]     "
-        f"[dim](Ctrl+C to quit)[/dim]"
+        f"Uptime: [bold]{_format_uptime(snap['uptime'])}[/bold]"
     )
-    return Panel(text, title="[bold]Network Analyzer[/bold]",
+    right = Text.from_markup("[dim](Ctrl+C to quit)[/dim]")
+
+    # A single-row grid pins the hint to the right edge regardless of width.
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(justify="left", ratio=1)
+    grid.add_column(justify="right")
+    grid.add_row(left, right)
+
+    return Panel(grid, title="[bold]Network Analyzer[/bold]",
                  border_style="blue", padding=(0, 1))
 
 
-def render_packets(snap: dict) -> Panel:
+def render_packets(snap: dict, max_rows: int | None = None) -> Panel:
     table = Table(expand=True, show_header=True, header_style="bold dim",
                   padding=(0, 1), box=None)
     table.add_column("Time", width=12, style="dim")
@@ -182,22 +193,33 @@ def render_packets(snap: dict) -> Panel:
     table.add_column("Source", overflow="ellipsis", ratio=2)
     table.add_column("→", width=1, justify="center", style="dim")
     table.add_column("Destination", overflow="ellipsis", ratio=2)
-    table.add_column("Bytes", width=7, justify="right", style="dim")
+    table.add_column("Org", overflow="ellipsis", ratio=1, style=ORG_STYLE)
+    table.add_column("Bytes", width=9, justify="right", style="dim")
 
-    if not snap["packets"]:
+    packets = snap["packets"]
+    if max_rows is not None and max_rows > 0:
+        # Show only the most recent rows that fit on screen.
+        packets = packets[-max_rows:]
+
+    if not packets:
         table.add_row("", "", "[dim italic]waiting for packets…[/dim italic]",
-                      "", "", "")
+                      "", "", "", "")
     else:
-        for info in snap["packets"]:
+        for info in packets:
             proto = info.get("protocol", "?")
             style = PROTOCOL_STYLES.get(proto, "white")
-            src = info.get("src") or "?"
-            if info.get("sport") is not None:
-                src = f"{src}:{info['sport']}"
-            dst = info.get("dst") or "?"
-            if info.get("dport") is not None:
-                dst = f"{dst}:{info['dport']}"
-            # Just the HH:MM:SS.mmm portion of the timestamp
+            src_ip = info.get("src") or "?"
+            dst_ip = info.get("dst") or "?"
+            src = f"{src_ip}:{info['sport']}" if info.get("sport") is not None else src_ip
+            dst = f"{dst_ip}:{info['dport']}" if info.get("dport") is not None else dst_ip
+
+            # Identify the non-local endpoint for the Org column. Prefer the
+            # destination unless it's local and the source isn't.
+            org = ipnames.resolve(dst_ip) or ipnames.resolve(src_ip) or ""
+            # Don't bother showing "Private LAN" — it's just noise here.
+            if org in ("Private LAN", "Loopback", "Link-local"):
+                org = ""
+
             ts = (info.get("timestamp") or "")[-12:]
             length = info.get("length", 0)
 
@@ -207,6 +229,7 @@ def render_packets(snap: dict) -> Panel:
                 src,
                 "→",
                 dst,
+                org,
                 f"{length:,}",
             )
 
@@ -231,20 +254,27 @@ def render_alerts(snap: dict) -> Panel:
         style = SEVERITY_STYLES.get(sev, "white")
         icon = "⚠" if sev in ("high", "critical") else "◐"
         atype = (alert.get("type") or "?").upper()
-        # Just HH:MM:SS from the alert timestamp
         ts = (alert.get("timestamp") or "")[-8:]
+
+        # source may be "ip" or "ip:port"; resolve the org from the bare IP.
         src = alert.get("source", "?")
+        src_ip = src.rsplit(":", 1)[0] if ":" in src else src
+        src_org = ipnames.resolve(src_ip)
+        src_disp = f"{src} [{ORG_STYLE}]({src_org})[/{ORG_STYLE}]" if src_org else src
+
         dst = alert.get("destination_ip") or "—"
-        msg = alert.get("message", "")
-        if len(msg) > 60:
-            msg = msg[:57] + "…"
+        dst_org = ipnames.resolve(dst) if dst != "—" else None
+        dst_disp = f"{dst} [{ORG_STYLE}]({dst_org})[/{ORG_STYLE}]" if dst_org else dst
+
+        msg = alert.get("message", "")  # full message, no truncation
 
         chunks.append(Text.from_markup(
             f"[{style}]{icon}  {sev.upper():<8} {atype:<14} {ts}[/{style}]"
         ))
         chunks.append(Text.from_markup(
-            f"   [dim]src=[/dim]{src}  [dim]dst=[/dim]{dst}"
+            f"   [dim]src=[/dim]{src_disp}  [dim]dst=[/dim]{dst_disp}"
         ))
+        # Let rich wrap the full description across lines as needed.
         chunks.append(Text.from_markup(f"   [dim]{msg}[/dim]"))
         chunks.append(Text(""))
 
@@ -256,8 +286,8 @@ def render_footer(snap: dict) -> Panel:
     # ---- protocol breakdown with mini bars --------------------------------
     total = sum(snap["protocols"].values())
     if total > 0:
-        bar_width = 20
-        proto_renderables: list = []
+        bar_width = 18
+        proto_renderables: list = [Text.from_markup("[bold]Protocols[/bold]")]
         for proto in ("TCP", "UDP", "ICMP", "Other"):
             count = snap["protocols"].get(proto, 0)
             pct = (count / total) * 100 if total else 0
@@ -266,26 +296,38 @@ def render_footer(snap: dict) -> Panel:
             style = PROTOCOL_STYLES.get(proto, "white")
             proto_renderables.append(Text.from_markup(
                 f"[{style}]{proto:<5}[/{style}] {bar} "
-                f"[bold]{pct:>5.1f}%[/bold]  [dim]({count:,} pkts)[/dim]"
+                f"[bold]{pct:>5.1f}%[/bold]  [dim]({count:,})[/dim]"
             ))
         proto_block = Group(*proto_renderables)
     else:
         proto_block = Text("no traffic yet", style="dim italic")
 
-    # ---- top talkers ------------------------------------------------------
-    if snap["top_talkers"]:
-        talker_parts = [
-            f"[bold]{ip}[/bold] [dim]({_format_bytes(b)})[/dim]"
-            for ip, b in snap["top_talkers"]
-        ]
-        talker_text = Text.from_markup(
-            "[dim]Top talkers:[/dim] " + "    ".join(talker_parts)
-        )
+    # ---- top talkers as a horizontal bar graph ----------------------------
+    talkers = snap["top_talkers"]
+    if talkers:
+        bar_width = 18
+        max_bytes = max(b for _, b in talkers) or 1
+        talker_renderables: list = [Text.from_markup("[bold]Top Talkers (by bytes)[/bold]")]
+        for ip, b in talkers:
+            filled = int(round((b / max_bytes) * bar_width))
+            bar = "█" * filled + "░" * (bar_width - filled)
+            org = ipnames.resolve(ip)
+            label = f"{ip} [{ORG_STYLE}]({org})[/{ORG_STYLE}]" if org else ip
+            talker_renderables.append(Text.from_markup(
+                f"[magenta]{bar}[/magenta] [bold]{_format_bytes(b):>9}[/bold]  {label}"
+            ))
+        talker_block = Group(*talker_renderables)
     else:
-        talker_text = Text("Top talkers: (none yet)", style="dim italic")
+        talker_block = Text("Top talkers: (none yet)", style="dim italic")
+
+    # Two columns side by side: protocols on the left, talkers on the right.
+    grid = Table.grid(expand=True, padding=(0, 2))
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(proto_block, talker_block)
 
     return Panel(
-        Group(proto_block, Text(""), talker_text),
+        grid,
         title="[bold]Traffic Stats[/bold]",
         border_style="green",
         padding=(0, 1),
@@ -301,7 +343,7 @@ def build_layout() -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main"),
-        Layout(name="footer", size=9),
+        Layout(name="footer", size=8),
     )
     layout["main"].split_row(
         Layout(name="packets"),
@@ -310,10 +352,21 @@ def build_layout() -> Layout:
     return layout
 
 
-def _refresh(layout: Layout, state: TUIState) -> None:
+# Fixed vertical chrome around the packet rows: header(3) + footer(8) +
+# packet panel borders/title(2) + table header row(1). Used to work out how
+# many packet rows actually fit so a fullscreen window stays full.
+_VERTICAL_CHROME = 3 + 8 + 2 + 1
+
+
+def _packet_capacity(console_height: int) -> int:
+    """How many packet rows fit given the current terminal height."""
+    return max(5, console_height - _VERTICAL_CHROME)
+
+
+def _refresh(layout: Layout, state: TUIState, packet_rows: int) -> None:
     snap = state.snapshot()
     layout["header"].update(render_header(snap))
-    layout["packets"].update(render_packets(snap))
+    layout["packets"].update(render_packets(snap, max_rows=packet_rows))
     layout["alerts"].update(render_alerts(snap))
     layout["footer"].update(render_footer(snap))
 
@@ -326,16 +379,21 @@ def run_tui(state: TUIState, refresh_per_second: int = 4) -> None:
     writes into `state`. This function blocks until the user interrupts.
     """
     layout = build_layout()
-    _refresh(layout, state)  # initial paint so the window isn't blank
 
     # screen=True swaps to the alt screen buffer — clean exit on Ctrl+C
     # returns the terminal to its prior state without scrollback pollution.
     with Live(layout, refresh_per_second=refresh_per_second,
               screen=True, redirect_stderr=False) as live:
+        # Initial paint using the live console's measured height.
+        rows = _packet_capacity(live.console.size.height)
+        _refresh(layout, state, rows)
         try:
             interval = 1.0 / refresh_per_second
             while True:
-                _refresh(layout, state)
+                # Re-measure each tick so resizing the window adjusts the
+                # number of visible packet rows on the fly.
+                rows = _packet_capacity(live.console.size.height)
+                _refresh(layout, state, rows)
                 time.sleep(interval)
         except KeyboardInterrupt:
             pass
@@ -359,30 +417,32 @@ if __name__ == "__main__":
     state = TUIState()
 
     # First, bulk-fill to build realistic top-talker / protocol stats.
-    # These get pushed out of the recent-packets deque (good — they're
-    # repetitive). The interesting samples are added last so they're
-    # what appears in the rendered packet feed.
+    # Use real provider IPs so the org lookup and bar graph have content.
     for _ in range(2000):
-        state.record_packet({"protocol": "TCP", "src": "10.0.0.5", "length": 1500})
+        state.record_packet({"protocol": "TCP", "src": "104.29.157.64", "length": 1500})
     for _ in range(800):
         state.record_packet({"protocol": "TCP", "src": "162.159.130.234", "length": 1500})
     for _ in range(300):
         state.record_packet({"protocol": "UDP", "src": "8.8.8.8", "length": 100})
+    for _ in range(150):
+        state.record_packet({"protocol": "TCP", "src": "140.82.114.26", "length": 800})
+    for _ in range(80):
+        state.record_packet({"protocol": "TCP", "src": "10.16.98.107", "length": 600})
 
     sample_packets = [
         {"timestamp": "2026-05-19 13:42:01.234", "protocol": "TCP",
-         "src": "10.0.0.5", "sport": 54221, "dst": "162.159.130.234", "dport": 443,
+         "src": "10.16.98.107", "sport": 54221, "dst": "162.159.130.234", "dport": 443,
          "length": 1420},
         {"timestamp": "2026-05-19 13:42:01.456", "protocol": "UDP",
-         "src": "10.0.0.5", "sport": 53000, "dst": "8.8.8.8", "dport": 53,
+         "src": "10.16.98.107", "sport": 53000, "dst": "8.8.8.8", "dport": 53,
          "length": 68},
         {"timestamp": "2026-05-19 13:42:02.001", "protocol": "TCP",
-         "src": "162.159.130.234", "sport": 443, "dst": "10.0.0.5", "dport": 54221,
+         "src": "104.29.157.64", "sport": 443, "dst": "10.16.98.107", "dport": 54221,
          "length": 60},
         {"timestamp": "2026-05-19 13:42:02.789", "protocol": "ICMP",
-         "src": "10.0.0.5", "dst": "8.8.8.8", "length": 84},
+         "src": "10.16.98.107", "dst": "8.8.8.8", "length": 84},
         {"timestamp": "2026-05-19 13:42:03.100", "protocol": "TCP",
-         "src": "10.0.0.5", "sport": 49283, "dst": "140.82.114.26", "dport": 443,
+         "src": "10.16.98.107", "sport": 49283, "dst": "140.82.114.26", "dport": 443,
          "length": 372},
     ]
     for p in sample_packets:
@@ -391,19 +451,19 @@ if __name__ == "__main__":
     state.record_alert({
         "timestamp": "2026-05-19 13:42:05",
         "type": "port_scan", "severity": "medium",
-        "source": "10.0.0.99",
-        "message": "16 unique destination ports contacted in 60s",
+        "source": "10.16.96.1",
+        "message": "16 unique destination ports contacted in 60s (threshold=15)",
     })
     state.record_alert({
         "timestamp": "2026-05-19 13:42:08",
         "type": "dns_anomaly", "severity": "high",
-        "source": "10.0.0.7", "destination_ip": "8.8.8.8",
-        "message": "DNS query with 76-char domain name — possible tunneling",
+        "source": "10.16.98.107", "destination_ip": "8.8.8.8",
+        "message": "DNS query with 64-char domain name (threshold=50) — possible DNS tunneling",
     })
 
     snap = state.snapshot()
     console = Console()
     console.print(render_header(snap))
-    console.print(render_packets(snap))
+    console.print(render_packets(snap, max_rows=10))
     console.print(render_alerts(snap))
     console.print(render_footer(snap))

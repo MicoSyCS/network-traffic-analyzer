@@ -30,7 +30,7 @@ import threading
 
 from capture import start_capture
 from detector import PortScanDetector, DNSAnomalyDetector, LargeTransferDetector
-from logger import AlertLogger
+from logger import AlertLogger, make_session_paths
 from tui import TUIState, run_tui
 
 
@@ -121,14 +121,16 @@ def build_pipeline(args):
             print_alerts=not quiet,
         ),
     ]
-    alert_logger = AlertLogger(print_alerts=not quiet)
+    db_path, txt_path = make_session_paths()
+    alert_logger = AlertLogger(db_path=db_path, txt_path=txt_path,
+                               print_alerts=not quiet)
 
     if not quiet:
         print(f"[+] Detectors enabled:")
         print(f"      port_scan       >{args.scan_threshold} ports / {args.scan_window}s")
         print(f"      dns_anomaly     domain length > {args.dns_max_length}")
         print(f"      large_transfer  TCP flow > {args.transfer_threshold_mb} MB")
-        print(f"[+] Alerts → {alert_logger.db_path}  &  {alert_logger.txt_path}")
+        print(f"[+] Session logs → {db_path.parent}")
 
     def on_packet(info, pkt):
         for d in detectors:

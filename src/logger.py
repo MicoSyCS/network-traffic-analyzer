@@ -55,6 +55,23 @@ colorama_init(autoreset=True)
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "logs" / "alerts.db"
 _DEFAULT_TXT_PATH = Path(__file__).resolve().parent.parent / "logs" / "alerts.log"
 
+_LOGS_ROOT = Path(__file__).resolve().parent.parent / "logs"
+
+
+def make_session_paths(root: Path | str | None = None) -> tuple[Path, Path]:
+    """
+    Build a fresh per-session log directory and return (db_path, txt_path).
+
+    Each call creates  logs/session_YYYYMMDD_HHMMSS/  containing alerts.db
+    and alerts.log, so every run of the tool gets its own isolated logs
+    instead of appending to one ever-growing file.
+    """
+    base = Path(root) if root else _LOGS_ROOT
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = base / f"session_{stamp}"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_dir / "alerts.db", session_dir / "alerts.log"
+
 
 # Severities we explicitly recognize. Anything else is normalized to "low".
 _SEVERITY_LEVELS = {"low", "medium", "high", "critical"}
