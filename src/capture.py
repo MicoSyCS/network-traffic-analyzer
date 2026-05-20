@@ -162,28 +162,39 @@ def _make_handler(on_packet=None):
     return handler
 
 
-def start_capture(interface=None, count=0, bpf_filter=None, on_packet=None):
+def start_capture(interface=None, count=0, bpf_filter=None, on_packet=None,
+                  offline=None):
     """
-    Start a live packet capture.
+    Start a packet capture — either live (default) or by replaying a pcap.
 
     Args:
         interface:  Network interface to sniff on (None = Scapy default).
+                    Ignored when `offline` is set.
         count:      Number of packets to capture (0 = unlimited).
         bpf_filter: Optional BPF filter string, e.g. "tcp port 80".
         on_packet:  Optional callback receiving (info_dict, raw_packet)
                     after each packet is printed. Useful for logging
                     or writing to /data.
+        offline:    Path to a .pcap/.pcapng file. When set, packets are
+                    read from the file instead of a live interface and
+                    sniff() returns once the file is exhausted.
 
-    Note: Sniffing usually requires root/admin privileges.
+    Note: live sniffing usually requires root/admin privileges.
     """
     print("─" * 88)
-    print(f"Starting capture  iface={interface or 'default'}  "
-          f"count={'∞' if count == 0 else count}  "
-          f"filter={bpf_filter or 'none'}")
+    if offline:
+        print(f"Replaying pcap     file={offline}  "
+              f"count={'all' if count == 0 else count}  "
+              f"filter={bpf_filter or 'none'}")
+    else:
+        print(f"Starting capture  iface={interface or 'default'}  "
+              f"count={'∞' if count == 0 else count}  "
+              f"filter={bpf_filter or 'none'}")
     print("─" * 88)
 
     sniff(
-        iface=interface,
+        iface=interface if not offline else None,
+        offline=offline,
         prn=_make_handler(on_packet),
         count=count,
         filter=bpf_filter,
