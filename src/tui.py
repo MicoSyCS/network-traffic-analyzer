@@ -48,6 +48,7 @@ from rich.table import Table
 from rich.text import Text
 
 import ipnames
+from keyboard import KeyReader
 
 
 # ---- color/style choices --------------------------------------------------
@@ -68,10 +69,10 @@ PROTOCOL_STYLES = {
 ORG_STYLE = "dim italic"  # styling for the "(Cloudflare)" annotations
 
 # ---- how much history to retain in memory --------------------------------
-# Keep a generous buffer so a maximized/fullscreen terminal can show many
-# rows. render_packets() trims to whatever actually fits on screen.
-MAX_PACKET_ROWS = 500
-MAX_ALERT_ROWS = 50
+# Keep a large buffer so the user can pause and scroll back through history.
+# render_packets() trims to whatever actually fits on screen (plus scroll).
+MAX_PACKET_ROWS = 5000
+MAX_ALERT_ROWS = 200
 
 
 class TUIState:
@@ -89,12 +90,119 @@ class TUIState:
         self._packets: deque = deque(maxlen=max_packets)
         self._alerts: deque = deque(maxlen=max_alerts)
         self._talkers: Counter[str] = Counter()      # src IP → cumulative bytes
+        # Rolling per-(second, ip) byte buckets so "top talkers" reflects
+        # RECENT activity, not all-time totals. Without this, a few early
+        # heavy-hitters dominate forever and the chart appears frozen.
+        self._talker_window: deque = deque()  # (sec:int, ip:str, bytes:int)
+        self._talker_window_seconds: int = 60
         self._protocols: Counter[str] = Counter()    # bucket → packet count
         self._total_packets: int = 0
         self._total_alerts: int = 0
         self._start_time: float = time.time()
         self._sniffer_alive: bool = True
         self._sniffer_error: str | None = None
+
+        # ---- pause / scroll state (mutated from the render thread) -------
+        # paused: feed is frozen; scroll_offset = how many rows back from the
+        # newest packet the viewport's BOTTOM sits. 0 = live (showing newest).
+        self._paused: bool = False
+        self._scroll_offset: int = 0
+        # Snapshot of the packet list taken at pause-time. Stored as a real
+        # list copy so deque rotation after pausing can't shift the window.
+        self._frozen_packets: list = []
+
+        # ---- focus / alert scroll (render thread only) -------------------
+        # focus: which panel arrow keys currently drive ("packets" or "alerts")
+        # alert_scroll_offset: alerts scrolled back from newest (0 = newest)
+        self._focus: str = "packets"
+        self._alert_scroll_offset: int = 0
+
+    # ------------------- pause / scroll control (render thread) ----------
+
+    def toggle_pause(self) -> bool:
+        """Flip paused state. On resume, snap back to live. Returns new state."""
+        with self._lock:
+            self._paused = not self._paused
+            if self._paused:
+                self._frozen_packets = list(self._packets)
+            else:
+                self._scroll_offset = 0  # snap-to-live on resume
+                self._frozen_packets = []
+            return self._paused
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def scroll(self, rows: int, viewport: int) -> None:
+        """
+        Move the viewport by `rows` (negative = toward older, positive = newer).
+        `viewport` is how many rows are visible, used to clamp the offset so we
+        never scroll past the ends. Scrolling AUTO-PAUSES the feed — otherwise
+        new packets keep shifting the buffer underneath and the window can't
+        hold still, making scroll appear to do nothing.
+        """
+        with self._lock:
+            if not self._paused:
+                self._paused = True
+                self._frozen_packets = list(self._packets)
+            self._apply_scroll(rows, viewport)
+
+    def scroll_to_end(self, which: str, viewport: int = 1) -> None:
+        """
+        Jump to oldest ('home') or newest ('end').
+
+        'home' auto-pauses and jumps to the oldest visible page.
+        'end' snaps to live and RESUMES the feed.
+        """
+        with self._lock:
+            if which == "end":
+                self._scroll_offset = 0
+                self._paused = False
+                self._frozen_packets = []
+            else:  # home: pause and jump to oldest visible page
+                if not self._paused:
+                    self._paused = True
+                    self._frozen_packets = list(self._packets)
+                buf_len = len(self._frozen_packets)
+                self._scroll_offset = max(0, buf_len - viewport)
+
+    def get_focus(self) -> str:
+        """Return current focus without doing a full snapshot copy."""
+        with self._lock:
+            return self._focus
+
+    def cycle_focus(self) -> str:
+        """Toggle focus between packets and alerts panels. Returns new focus."""
+        with self._lock:
+            self._focus = "alerts" if self._focus == "packets" else "packets"
+            return self._focus
+
+    def scroll_alerts(self, rows: int, viewport: int) -> None:
+        """Scroll the alerts panel by `rows` lines (negative = toward older)."""
+        with self._lock:
+            lines_per_alert = 4
+            max_offset = max(0, len(self._alerts) * lines_per_alert - viewport)
+            self._alert_scroll_offset = max(
+                0, min(max_offset, self._alert_scroll_offset - rows)
+            )
+
+    def scroll_alerts_to_end(self, which: str, viewport: int = 1) -> None:
+        """Jump alerts viewport to newest ('end') or oldest ('home')."""
+        with self._lock:
+            lines_per_alert = 4
+            if which == "end":
+                self._alert_scroll_offset = 0
+            else:
+                self._alert_scroll_offset = max(
+                    0, len(self._alerts) * lines_per_alert - viewport
+                )
+
+    def _apply_scroll(self, rows: int, viewport: int) -> None:
+        """Clamp-and-set scroll offset. Caller holds the lock."""
+        buf_len = len(self._frozen_packets) if self._paused else len(self._packets)
+        max_offset = max(0, buf_len - viewport)
+        self._scroll_offset = max(0, min(max_offset, self._scroll_offset - rows))
 
     # ------------------- writers (called from sniffer thread) ------------
 
@@ -105,7 +213,11 @@ class TUIState:
 
             src = info.get("src")
             if src and src != "?":
-                self._talkers[src] += info.get("length", 0) or 0
+                length = info.get("length", 0) or 0
+                self._talkers[src] += length  # kept for all-time stats if needed
+                # Append to the rolling window (bucketed by whole second).
+                now = int(time.time())
+                self._talker_window.append((now, src, length))
 
             proto = info.get("protocol", "Other")
             if proto not in ("TCP", "UDP", "ICMP"):
@@ -122,6 +234,21 @@ class TUIState:
             self._sniffer_alive = False
             self._sniffer_error = error
 
+    def _top_talkers_windowed(self, n: int = 5) -> list:
+        """
+        Top `n` source IPs by bytes within the rolling window. Caller holds
+        the lock. Evicts buckets older than the window as a side effect, so
+        the deque stays bounded on a long-running capture.
+        """
+        cutoff = int(time.time()) - self._talker_window_seconds
+        win = self._talker_window
+        while win and win[0][0] <= cutoff:
+            win.popleft()
+        totals: Counter[str] = Counter()
+        for _sec, ip, length in win:
+            totals[ip] += length
+        return totals.most_common(n)
+
     # ------------------- reader (called from main/render thread) ---------
 
     def snapshot(self) -> dict:
@@ -129,14 +256,20 @@ class TUIState:
         with self._lock:
             return {
                 "uptime":         time.time() - self._start_time,
-                "packets":        list(self._packets),
+                "packets":        self._frozen_packets if self._paused else list(self._packets),
                 "alerts":         list(self._alerts),
                 "total_packets":  self._total_packets,
                 "total_alerts":   self._total_alerts,
-                "top_talkers":    self._talkers.most_common(5),
+                "top_talkers":         self._top_talkers_windowed(5),
+                "top_talkers_alltime": self._talkers.most_common(5),
                 "protocols":      dict(self._protocols),
                 "sniffer_alive":  self._sniffer_alive,
                 "sniffer_error":  self._sniffer_error,
+                "paused":         self._paused,
+                "scroll_offset":  self._scroll_offset,
+                "buffer_size":    len(self._packets),
+                "focus":          self._focus,
+                "alert_scroll_offset": self._alert_scroll_offset,
             }
 
 
@@ -167,19 +300,39 @@ def render_header(snap: dict) -> Panel:
     else:
         status = "[yellow]○ Stopped[/yellow]"
 
-    left = Text.from_markup(
-        f"{status}     "
-        f"Packets: [bold cyan]{snap['total_packets']:,}[/bold cyan]     "
-        f"Alerts: [bold red]{snap['total_alerts']}[/bold red]     "
-        f"Uptime: [bold]{_format_uptime(snap['uptime'])}[/bold]"
-    )
-    right = Text.from_markup("[dim](Ctrl+C to quit)[/dim]")
+    # Show pause state and/or scroll position in the header.
+    pause_tag = ""
+    offset = snap.get("scroll_offset", 0)
+    if snap.get("paused"):
+        # Use non-breaking space (\xa0) between PAUSED and the offset so
+        # rich doesn't line-break between them in narrow terminals.
+        if offset > 0:
+            pause_tag = f"  [bold yellow]⏸\xa0PAUSED\xa0−{offset}[/bold yellow]"
+        else:
+            pause_tag = "  [bold yellow]⏸\xa0PAUSED[/bold yellow]"
 
-    # A single-row grid pins the hint to the right edge regardless of width.
+    left = Text.from_markup(
+        f"{status}  "
+        f"Pkts: [bold cyan]{snap['total_packets']:,}[/bold cyan]  "
+        f"Alerts: [bold red]{snap['total_alerts']}[/bold red]"
+        f"{pause_tag}"
+    )
+    center = Text.from_markup(
+        f"Uptime: [bold]{_format_uptime(snap['uptime'])}[/bold]",
+        justify="center",
+    )
+    right = Text.from_markup(
+        "[dim]Tab=switch  Space=pause  q=quit[/dim]",
+        justify="right",
+    )
+
+    # Three equal-ratio columns so the uptime sits in the true center of the
+    # terminal width rather than just center-aligned within a variable column.
     grid = Table.grid(expand=True, padding=(0, 1))
-    grid.add_column(justify="left", ratio=1)
-    grid.add_column(justify="right")
-    grid.add_row(left, right)
+    grid.add_column(justify="left",  ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="right",  ratio=1)
+    grid.add_row(left, center, right)
 
     return Panel(grid, title="[bold]Network Analyzer[/bold]",
                  border_style="blue", padding=(0, 1))
@@ -196,10 +349,20 @@ def render_packets(snap: dict, max_rows: int | None = None) -> Panel:
     table.add_column("Org", overflow="ellipsis", ratio=1, style=ORG_STYLE)
     table.add_column("Bytes", width=9, justify="right", style="dim")
 
-    packets = snap["packets"]
+    all_packets = snap["packets"]
+    offset = snap.get("scroll_offset", 0)
+
     if max_rows is not None and max_rows > 0:
-        # Show only the most recent rows that fit on screen.
-        packets = packets[-max_rows:]
+        if offset > 0:
+            # Viewport bottom sits `offset` rows back from the newest packet.
+            # Slice a window of `max_rows` ending at (len - offset).
+            end = max(0, len(all_packets) - offset)
+            start = max(0, end - max_rows)
+            packets = all_packets[start:end]
+        else:
+            packets = all_packets[-max_rows:]
+    else:
+        packets = all_packets
 
     if not packets:
         table.add_row("", "", "[dim italic]waiting for packets…[/dim italic]",
@@ -233,23 +396,42 @@ def render_packets(snap: dict, max_rows: int | None = None) -> Panel:
                 f"{length:,}",
             )
 
-    return Panel(table, title="[bold]Live Packets[/bold]",
-                 border_style="cyan", padding=(0, 1))
+    # Title reflects focus/pause state.
+    focused_packets = snap.get("focus") != "alerts"
+    focus_marker = "[bold bright_cyan]▸ [/bold bright_cyan]" if focused_packets else ""
+    if snap.get("paused"):
+        title = f"{focus_marker}[bold]Packets[/bold]  [yellow]⏸ paused[/yellow]"
+        border = "yellow"
+    else:
+        scroll_note = f" [dim](−{offset} rows)[/dim]" if offset > 0 else ""
+        title = f"{focus_marker}[bold]Live Packets[/bold]{scroll_note}"
+        border = "bright_cyan" if focused_packets else "cyan"
+
+    return Panel(table, title=title, border_style=border, padding=(0, 1))
 
 
 def render_alerts(snap: dict) -> Panel:
     alerts = snap["alerts"]
+    focused = snap.get("focus") == "alerts"
+    alert_offset = snap.get("alert_scroll_offset", 0)
+    lines_per_alert = 4
+    border = "bright_red" if focused else "red"
+    focus_marker = "[bold bright_red]▸ [/bold bright_red]" if focused else ""
     if not alerts:
         return Panel(
             Align.center(Text("no alerts yet", style="dim italic"),
                          vertical="middle"),
-            title="[bold]Alerts[/bold]",
-            border_style="red",
+            title=f"{focus_marker}[bold]Alerts[/bold]",
+            border_style=border,
         )
 
+    # Each alert renders as 4 lines; skip based on scroll offset.
+    all_reversed = list(reversed(alerts))  # newest first
+    skip_alerts = alert_offset // lines_per_alert
+    visible_alerts = all_reversed[skip_alerts:]
+
     chunks: list = []
-    # Newest first — alerts are rarer and more important than packets.
-    for alert in reversed(alerts):
+    for alert in visible_alerts:
         sev = (alert.get("severity") or "low").lower()
         style = SEVERITY_STYLES.get(sev, "white")
         icon = "⚠" if sev in ("high", "critical") else "◐"
@@ -278,15 +460,35 @@ def render_alerts(snap: dict) -> Panel:
         chunks.append(Text.from_markup(f"   [dim]{msg}[/dim]"))
         chunks.append(Text(""))
 
-    return Panel(Group(*chunks), title="[bold]Alerts[/bold]",
-                 border_style="red", padding=(0, 1))
+    scroll_note = f" [dim](−{skip_alerts} alerts back)[/dim]" if skip_alerts > 0 else ""
+    return Panel(Group(*chunks),
+                 title=f"{focus_marker}[bold]Alerts[/bold]{scroll_note}",
+                 border_style=border, padding=(0, 1))
+
+
+def _render_talker_graph(talkers: list, title: str) -> Group | Text:
+    """Render a single top-talkers bar graph block."""
+    if not talkers:
+        return Text(f"{title}: (none yet)", style="dim italic")
+    bar_width = 14
+    max_bytes = max(b for _, b in talkers) or 1
+    renderables: list = [Text.from_markup(f"[bold]{title}[/bold]")]
+    for ip, b in talkers:
+        filled = int(round((b / max_bytes) * bar_width))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        org = ipnames.resolve(ip)
+        label = f"{ip} [{ORG_STYLE}]({org})[/{ORG_STYLE}]" if org else ip
+        renderables.append(Text.from_markup(
+            f"[magenta]{bar}[/magenta] [bold]{_format_bytes(b):>9}[/bold]  {label}"
+        ))
+    return Group(*renderables)
 
 
 def render_footer(snap: dict) -> Panel:
     # ---- protocol breakdown with mini bars --------------------------------
     total = sum(snap["protocols"].values())
     if total > 0:
-        bar_width = 18
+        bar_width = 12
         proto_renderables: list = [Text.from_markup("[bold]Protocols[/bold]")]
         for proto in ("TCP", "UDP", "ICMP", "Other"):
             count = snap["protocols"].get(proto, 0)
@@ -294,37 +496,26 @@ def render_footer(snap: dict) -> Panel:
             filled = int(round(pct / 100 * bar_width))
             bar = "█" * filled + "░" * (bar_width - filled)
             style = PROTOCOL_STYLES.get(proto, "white")
+            # Non-breaking spaces keep the count attached to the percentage
+            # so rich never line-breaks in the middle of the row.
             proto_renderables.append(Text.from_markup(
-                f"[{style}]{proto:<5}[/{style}] {bar} "
-                f"[bold]{pct:>5.1f}%[/bold]  [dim]({count:,})[/dim]"
+                f"[{style}]{proto:<5}[/{style}] {bar}\xa0"
+                f"[bold]{pct:>5.1f}%[/bold]\xa0[dim]({count:,})[/dim]"
             ))
         proto_block = Group(*proto_renderables)
     else:
         proto_block = Text("no traffic yet", style="dim italic")
 
-    # ---- top talkers as a horizontal bar graph ----------------------------
-    talkers = snap["top_talkers"]
-    if talkers:
-        bar_width = 18
-        max_bytes = max(b for _, b in talkers) or 1
-        talker_renderables: list = [Text.from_markup("[bold]Top Talkers (by bytes)[/bold]")]
-        for ip, b in talkers:
-            filled = int(round((b / max_bytes) * bar_width))
-            bar = "█" * filled + "░" * (bar_width - filled)
-            org = ipnames.resolve(ip)
-            label = f"{ip} [{ORG_STYLE}]({org})[/{ORG_STYLE}]" if org else ip
-            talker_renderables.append(Text.from_markup(
-                f"[magenta]{bar}[/magenta] [bold]{_format_bytes(b):>9}[/bold]  {label}"
-            ))
-        talker_block = Group(*talker_renderables)
-    else:
-        talker_block = Text("Top talkers: (none yet)", style="dim italic")
+    # ---- top talkers: two separate graphs side by side --------------------
+    recent_block = _render_talker_graph(snap["top_talkers"], "Top Talkers (60s)")
+    alltime_block = _render_talker_graph(snap["top_talkers_alltime"], "Top Talkers (All Time)")
 
-    # Two columns side by side: protocols on the left, talkers on the right.
+    # Three columns: protocols | recent talkers | all-time talkers
     grid = Table.grid(expand=True, padding=(0, 2))
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
-    grid.add_row(proto_block, talker_block)
+    grid.add_column(ratio=1)
+    grid.add_row(proto_block, recent_block, alltime_block)
 
     return Panel(
         grid,
@@ -343,7 +534,7 @@ def build_layout() -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main"),
-        Layout(name="footer", size=8),
+        Layout(name="footer", size=9),
     )
     layout["main"].split_row(
         Layout(name="packets"),
@@ -352,10 +543,10 @@ def build_layout() -> Layout:
     return layout
 
 
-# Fixed vertical chrome around the packet rows: header(3) + footer(8) +
+# Fixed vertical chrome around the packet rows: header(3) + footer(10) +
 # packet panel borders/title(2) + table header row(1). Used to work out how
 # many packet rows actually fit so a fullscreen window stays full.
-_VERTICAL_CHROME = 3 + 8 + 2 + 1
+_VERTICAL_CHROME = 3 + 9 + 2 + 1
 
 
 def _packet_capacity(console_height: int) -> int:
@@ -366,37 +557,106 @@ def _packet_capacity(console_height: int) -> int:
 def _refresh(layout: Layout, state: TUIState, packet_rows: int) -> None:
     snap = state.snapshot()
     layout["header"].update(render_header(snap))
+    layout["footer"].update(render_footer(snap))
     layout["packets"].update(render_packets(snap, max_rows=packet_rows))
     layout["alerts"].update(render_alerts(snap))
-    layout["footer"].update(render_footer(snap))
 
 
-def run_tui(state: TUIState, refresh_per_second: int = 4) -> None:
+def _handle_key(key: str, state: TUIState, viewport: int) -> bool:
     """
-    Run the live dashboard on the calling thread until Ctrl+C.
+    Apply one key press to the state. Returns True if the user asked to quit.
+    Tab cycles focus between Packets and Alerts; arrow/page/home/end keys
+    drive whichever panel is currently focused. Space always toggles pause.
+    """
+    if key in ("q", "Q"):
+        return True
+    if key == "SPACE":
+        state.toggle_pause()
+        return False
+    if key in ("TAB", "\t"):
+        state.cycle_focus()
+        return False
 
-    The sniffer must already be running in another (daemon) thread that
-    writes into `state`. This function blocks until the user interrupts.
+    focus = state.get_focus()
+    if focus == "alerts":
+        if key == "UP":
+            state.scroll_alerts(-1, viewport)
+        elif key == "DOWN":
+            state.scroll_alerts(1, viewport)
+        elif key == "PAGEUP":
+            state.scroll_alerts(-viewport, viewport)
+        elif key == "PAGEDOWN":
+            state.scroll_alerts(viewport, viewport)
+        elif key == "HOME":
+            state.scroll_alerts_to_end("home", viewport)
+        elif key == "END":
+            state.scroll_alerts_to_end("end")
+    else:
+        if key == "UP":
+            state.scroll(-1, viewport)
+        elif key == "DOWN":
+            state.scroll(1, viewport)
+        elif key == "PAGEUP":
+            state.scroll(-viewport, viewport)
+        elif key == "PAGEDOWN":
+            state.scroll(viewport, viewport)
+        elif key == "HOME":
+            state.scroll_to_end("home", viewport)
+        elif key == "END":
+            state.scroll_to_end("end")
+    return False
+
+
+def run_tui(state: TUIState, refresh_per_second: int = 8) -> None:
+    """
+    Run the live dashboard on the calling thread until the user quits
+    (Ctrl+C or 'q'). The sniffer must already be running in another
+    (daemon) thread that writes into `state`.
+
+    Keyboard shortcuts:
+        Tab          switch focus between Packets and Alerts panels
+        Space        pause / resume packet feed (snap to live on resume)
+        ↑ / ↓        scroll focused panel one row (auto-pauses packets)
+        PgUp / PgDn  scroll focused panel one page
+        Home / End   jump to oldest / newest in focused panel
+        q / Ctrl+C   quit
     """
     layout = build_layout()
 
-    # screen=True swaps to the alt screen buffer — clean exit on Ctrl+C
-    # returns the terminal to its prior state without scrollback pollution.
-    with Live(layout, refresh_per_second=refresh_per_second,
-              screen=True, redirect_stderr=False) as live:
-        # Initial paint using the live console's measured height.
-        rows = _packet_capacity(live.console.size.height)
-        _refresh(layout, state, rows)
-        try:
-            interval = 1.0 / refresh_per_second
-            while True:
-                # Re-measure each tick so resizing the window adjusts the
-                # number of visible packet rows on the fly.
-                rows = _packet_capacity(live.console.size.height)
-                _refresh(layout, state, rows)
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            pass
+    # screen=True swaps to the alt screen buffer — clean exit returns the
+    # terminal to its prior state without scrollback pollution.
+    # auto_refresh=False: we drive refreshes ourselves so key handling and
+    # rendering stay in lockstep and scrolling feels immediate.
+    with KeyReader() as keys:
+        with Live(layout, screen=True, auto_refresh=False,
+                  redirect_stderr=False) as live:
+            rows = _packet_capacity(live.console.size.height)
+            _refresh(layout, state, rows)
+            live.refresh()
+
+            poll_interval = 1.0 / max(refresh_per_second, 1)
+            try:
+                while True:
+                    rows = _packet_capacity(live.console.size.height)
+
+                    # Drain all keys waiting this tick (holding a key can
+                    # queue several); apply each.
+                    quit_requested = False
+                    while True:
+                        key = keys.poll()
+                        if key is None:
+                            break
+                        if _handle_key(key, state, viewport=rows):
+                            quit_requested = True
+                            break
+                    if quit_requested:
+                        break
+
+                    _refresh(layout, state, rows)
+                    live.refresh()
+                    time.sleep(poll_interval)
+            except KeyboardInterrupt:
+                pass
 
     # After the Live context exits, surface any sniffer error to the user
     # (otherwise it'd be lost — we suppress stdout while the TUI is running).
@@ -416,8 +676,6 @@ if __name__ == "__main__":
 
     state = TUIState()
 
-    # First, bulk-fill to build realistic top-talker / protocol stats.
-    # Use real provider IPs so the org lookup and bar graph have content.
     for _ in range(2000):
         state.record_packet({"protocol": "TCP", "src": "104.29.157.64", "length": 1500})
     for _ in range(800):

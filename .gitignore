@@ -1,0 +1,22 @@
+# Logs — every session creates its own folder here; none should be committed
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Distribution / build
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
