@@ -179,10 +179,13 @@ class TUIState:
             return self._focus
 
     def scroll_alerts(self, rows: int, viewport: int) -> None:
-        """Scroll the alerts panel by `rows` lines (negative = toward older)."""
+        """
+        Scroll the alerts panel. `rows` in alert units, negative = up (older).
+        `viewport` is the number of alerts visible — used to clamp so you can't
+        scroll further than there's history to show.
+        """
         with self._lock:
-            lines_per_alert = 4
-            max_offset = max(0, len(self._alerts) * lines_per_alert - viewport)
+            max_offset = max(0, len(self._alerts) - viewport)
             self._alert_scroll_offset = max(
                 0, min(max_offset, self._alert_scroll_offset - rows)
             )
@@ -190,13 +193,10 @@ class TUIState:
     def scroll_alerts_to_end(self, which: str, viewport: int = 1) -> None:
         """Jump alerts viewport to newest ('end') or oldest ('home')."""
         with self._lock:
-            lines_per_alert = 4
             if which == "end":
                 self._alert_scroll_offset = 0
             else:
-                self._alert_scroll_offset = max(
-                    0, len(self._alerts) * lines_per_alert - viewport
-                )
+                self._alert_scroll_offset = max(0, len(self._alerts) - viewport)
 
     def _apply_scroll(self, rows: int, viewport: int) -> None:
         """Clamp-and-set scroll offset. Caller holds the lock."""
@@ -300,29 +300,17 @@ def render_header(snap: dict) -> Panel:
     else:
         status = "[yellow]○ Stopped[/yellow]"
 
-    # Show pause state and/or scroll position in the header.
-    pause_tag = ""
-    offset = snap.get("scroll_offset", 0)
-    if snap.get("paused"):
-        # Use non-breaking space (\xa0) between PAUSED and the offset so
-        # rich doesn't line-break between them in narrow terminals.
-        if offset > 0:
-            pause_tag = f"  [bold yellow]⏸\xa0PAUSED\xa0−{offset}[/bold yellow]"
-        else:
-            pause_tag = "  [bold yellow]⏸\xa0PAUSED[/bold yellow]"
-
     left = Text.from_markup(
         f"{status}  "
         f"Pkts: [bold cyan]{snap['total_packets']:,}[/bold cyan]  "
         f"Alerts: [bold red]{snap['total_alerts']}[/bold red]"
-        f"{pause_tag}"
     )
     center = Text.from_markup(
         f"Uptime: [bold]{_format_uptime(snap['uptime'])}[/bold]",
         justify="center",
     )
     right = Text.from_markup(
-        "[dim]Tab=switch  Space=pause  q=quit[/dim]",
+        "[dim]Tab=focus  Space=pause  q=quit[/dim]",
         justify="right",
     )
 
@@ -396,49 +384,51 @@ def render_packets(snap: dict, max_rows: int | None = None) -> Panel:
                 f"{length:,}",
             )
 
-    # Title reflects focus/pause state.
     focused_packets = snap.get("focus") != "alerts"
-    focus_marker = "[bold bright_cyan]▸ [/bold bright_cyan]" if focused_packets else ""
+    focus_badge = " [bold reverse cyan] FOCUSED [/bold reverse cyan]" if focused_packets else ""
+    scroll_note = f" [dim](−{offset} rows)[/dim]" if offset > 0 else ""
     if snap.get("paused"):
-        title = f"{focus_marker}[bold]Packets[/bold]  [yellow]⏸ paused[/yellow]"
         border = "yellow"
     else:
-        scroll_note = f" [dim](−{offset} rows)[/dim]" if offset > 0 else ""
-        title = f"{focus_marker}[bold]Live Packets[/bold]{scroll_note}"
-        border = "bright_cyan" if focused_packets else "cyan"
+        border = "cyan"
+    title = f"[bold]Live Packets[/bold]{focus_badge}{scroll_note}"
 
     return Panel(table, title=title, border_style=border, padding=(0, 1))
 
 
-def render_alerts(snap: dict) -> Panel:
+def render_alerts(snap: dict, max_alerts: int = 20) -> Panel:
     alerts = snap["alerts"]
     focused = snap.get("focus") == "alerts"
-    alert_offset = snap.get("alert_scroll_offset", 0)
-    lines_per_alert = 4
-    border = "bright_red" if focused else "red"
-    focus_marker = "[bold bright_red]▸ [/bold bright_red]" if focused else ""
+    skip = snap.get("alert_scroll_offset", 0)
+    border = "red"
+    focus_badge = " [bold reverse red] FOCUSED [/bold reverse red]" if focused else ""
     if not alerts:
         return Panel(
             Align.center(Text("no alerts yet", style="dim italic"),
                          vertical="middle"),
-            title=f"{focus_marker}[bold]Alerts[/bold]",
+            title=f"[bold]Alerts[/bold]{focus_badge}",
             border_style=border,
         )
 
-    # Each alert renders as 4 lines; skip based on scroll offset.
-    all_reversed = list(reversed(alerts))  # newest first
-    skip_alerts = alert_offset // lines_per_alert
-    visible_alerts = all_reversed[skip_alerts:]
+    total = len(alerts)
+
+    # Sliding window: newest alerts sit at the bottom of the visible window.
+    # `skip` = how many alerts we've scrolled up past (hidden from the bottom).
+    # end is exclusive; it marks the boundary just past the newest visible alert.
+    end   = total - skip           # newest visible = alerts[end-1]
+    start = max(0, end - max_alerts)
+    visible_alerts = alerts[start:end]
 
     chunks: list = []
-    for alert in visible_alerts:
+    for i, alert in enumerate(visible_alerts):
+        alert_num = start + i + 1   # #1 = oldest in buffer, stable as we scroll
+
         sev = (alert.get("severity") or "low").lower()
         style = SEVERITY_STYLES.get(sev, "white")
         icon = "⚠" if sev in ("high", "critical") else "◐"
         atype = (alert.get("type") or "?").upper()
         ts = (alert.get("timestamp") or "")[-8:]
 
-        # source may be "ip" or "ip:port"; resolve the org from the bare IP.
         src = alert.get("source", "?")
         src_ip = src.rsplit(":", 1)[0] if ":" in src else src
         src_org = ipnames.resolve(src_ip)
@@ -448,21 +438,20 @@ def render_alerts(snap: dict) -> Panel:
         dst_org = ipnames.resolve(dst) if dst != "—" else None
         dst_disp = f"{dst} [{ORG_STYLE}]({dst_org})[/{ORG_STYLE}]" if dst_org else dst
 
-        msg = alert.get("message", "")  # full message, no truncation
+        msg = alert.get("message", "")
 
         chunks.append(Text.from_markup(
-            f"[{style}]{icon}  {sev.upper():<8} {atype:<14} {ts}[/{style}]"
+            f"[dim]#{alert_num:<3}[/dim] [{style}]{icon}  {sev.upper():<8} {atype:<14} {ts}[/{style}]"
         ))
         chunks.append(Text.from_markup(
-            f"   [dim]src=[/dim]{src_disp}  [dim]dst=[/dim]{dst_disp}"
+            f"     [dim]src=[/dim]{src_disp}  [dim]dst=[/dim]{dst_disp}"
         ))
-        # Let rich wrap the full description across lines as needed.
-        chunks.append(Text.from_markup(f"   [dim]{msg}[/dim]"))
+        chunks.append(Text.from_markup(f"     [dim]{msg}[/dim]"))
         chunks.append(Text(""))
 
-    scroll_note = f" [dim](−{skip_alerts} alerts back)[/dim]" if skip_alerts > 0 else ""
+    scroll_note = f" [dim](−{skip} rows)[/dim]" if skip > 0 else ""
     return Panel(Group(*chunks),
-                 title=f"{focus_marker}[bold]Alerts[/bold]{scroll_note}",
+                 title=f"[bold]Alerts[/bold]{focus_badge}{scroll_note}",
                  border_style=border, padding=(0, 1))
 
 
@@ -554,19 +543,31 @@ def _packet_capacity(console_height: int) -> int:
     return max(5, console_height - _VERTICAL_CHROME)
 
 
-def _refresh(layout: Layout, state: TUIState, packet_rows: int) -> None:
+def _alert_capacity(console_height: int) -> int:
+    """
+    How many alerts fit in the alerts panel at the current terminal height.
+    Each alert is 4 lines (header + src/dst + message + blank).
+    Chrome: header(3) + footer(9) + main borders(2) + alert panel borders+title(3).
+    """
+    lines_available = max(4, console_height - 3 - 9 - 2 - 3)
+    return max(1, lines_available // 4 + 1)
+
+
+def _refresh(layout: Layout, state: TUIState,
+             packet_rows: int, alert_rows: int) -> None:
     snap = state.snapshot()
     layout["header"].update(render_header(snap))
     layout["footer"].update(render_footer(snap))
     layout["packets"].update(render_packets(snap, max_rows=packet_rows))
-    layout["alerts"].update(render_alerts(snap))
+    layout["alerts"].update(render_alerts(snap, max_alerts=alert_rows))
 
 
-def _handle_key(key: str, state: TUIState, viewport: int) -> bool:
+def _handle_key(key: str, state: TUIState,
+                viewport: int, alert_viewport: int) -> bool:
     """
     Apply one key press to the state. Returns True if the user asked to quit.
-    Tab cycles focus between Packets and Alerts; arrow/page/home/end keys
-    drive whichever panel is currently focused. Space always toggles pause.
+    Tab cycles focus; arrow/page/home/end drive the focused panel.
+    `viewport` = visible packet rows, `alert_viewport` = visible alert rows.
     """
     if key in ("q", "Q"):
         return True
@@ -580,15 +581,15 @@ def _handle_key(key: str, state: TUIState, viewport: int) -> bool:
     focus = state.get_focus()
     if focus == "alerts":
         if key == "UP":
-            state.scroll_alerts(-1, viewport)
+            state.scroll_alerts(-1, alert_viewport)
         elif key == "DOWN":
-            state.scroll_alerts(1, viewport)
+            state.scroll_alerts(1, alert_viewport)
         elif key == "PAGEUP":
-            state.scroll_alerts(-viewport, viewport)
+            state.scroll_alerts(-alert_viewport, alert_viewport)
         elif key == "PAGEDOWN":
-            state.scroll_alerts(viewport, viewport)
+            state.scroll_alerts(alert_viewport, alert_viewport)
         elif key == "HOME":
-            state.scroll_alerts_to_end("home", viewport)
+            state.scroll_alerts_to_end("home", alert_viewport)
         elif key == "END":
             state.scroll_alerts_to_end("end")
     else:
@@ -631,28 +632,30 @@ def run_tui(state: TUIState, refresh_per_second: int = 8) -> None:
         with Live(layout, screen=True, auto_refresh=False,
                   redirect_stderr=False) as live:
             rows = _packet_capacity(live.console.size.height)
-            _refresh(layout, state, rows)
+            alert_rows = _alert_capacity(live.console.size.height)
+            _refresh(layout, state, rows, alert_rows)
             live.refresh()
 
             poll_interval = 1.0 / max(refresh_per_second, 1)
             try:
                 while True:
                     rows = _packet_capacity(live.console.size.height)
+                    alert_rows = _alert_capacity(live.console.size.height)
 
-                    # Drain all keys waiting this tick (holding a key can
-                    # queue several); apply each.
                     quit_requested = False
                     while True:
                         key = keys.poll()
                         if key is None:
                             break
-                        if _handle_key(key, state, viewport=rows):
+                        if _handle_key(key, state,
+                                       viewport=rows,
+                                       alert_viewport=alert_rows):
                             quit_requested = True
                             break
                     if quit_requested:
                         break
 
-                    _refresh(layout, state, rows)
+                    _refresh(layout, state, rows, alert_rows)
                     live.refresh()
                     time.sleep(poll_interval)
             except KeyboardInterrupt:

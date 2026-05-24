@@ -154,6 +154,8 @@ class KeyReader:
             return "ENTER"
         if ch == " ":
             return "SPACE"
+        if ch == "\t":
+            return "TAB"
         if ch == "\x03":  # Ctrl+C — let the caller decide (usually re-raise)
             raise KeyboardInterrupt
         if ch.isprintable():
